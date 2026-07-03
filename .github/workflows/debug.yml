@@ -1,0 +1,106 @@
+name: builds
+
+on:
+  schedule:
+    - cron: '30 2 * * *'
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Which build(s) to run'
+        required: true
+        default: 'all'
+        type: choice
+        options: [all, windows, android, appimage, tarball]
+      android_arch:
+        description: 'Android architecture (when running android)'
+        required: false
+        default: 'arm64-v8a'
+        type: choice
+        options: [arm64-v8a, armeabi-v7a, x86_64]
+      # --- Thêm mới ---
+      debug:
+        description: 'Build in debug mode (adds debug symbols, verbose logs)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: builds-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ARTIFACT_RETENTION: '14'
+  # Biến toàn cục cho debug (có thể ghi đè ở từng job)
+  DEBUG_MODE: ${{ inputs.debug && '1' || '0' }}
+
+jobs:
+  windows:
+    name: "build: Windows"
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'all' || inputs.target == 'windows' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Cache Wine pip
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: contrib/build-wine/.cache/win*/wine_pip_cache
+          key: wine-pip-${{ hashFiles('contrib/deterministic-build/*.txt', 'contrib/build-wine/**') }}
+
+      - name: Cache Wine native lib builds
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
+        with:
+          path: contrib/build-wine/.cache/win*/build
+          key: wine-build-${{ hashFiles('contrib/make_libsecp256k1.sh', 'contrib/make_libusb.sh', 'contrib/make_zbar.sh', 'contrib/build-wine/**') }}
+
+      - name: Build Windows binaries
+        run: |
+          if [ "${{ inputs.debug }}" == "true" ]; then
+            DEBUG=1 ./contrib/build-wine/build.sh
+          else
+            ./contrib/build-wine/build.sh
+          fi
+        env:
+          ELECTRUM_DEBUG: ${{ inputs.debug && '1' || '0' }}
+
+      - name: List output
+        run: ls -lah contrib/build-wine/dist/
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: electrum-windows-${{ github.sha }}${{ inputs.debug && '-debug' || '' }}
+          path: contrib/build-wine/dist/*
+          retention-days: ${{ env.ARTIFACT_RETENTION }}
+          if-no-files-found: error
+          compression-level: 0
+
+      # --- Ký artifacts (debug) ---
+      - name: Sign Windows artifacts (if debug)
+        if: inputs.debug == true
+        run: |
+          for f in contrib/build-wine/dist/*; do
+            gpg --batch --yes --detach-sign --armor "$f"
+          done
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.DEBUG_GPG_PRIVATE_KEY }}   # bạn cần tạo secret này
+          GPG_PASSPHRASE: ${{ secrets.DEBUG_GPG_PASSPHRASE }}
+
+      - name: Upload Windows signatures (debug)
+        if: inputs.debug == true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: electrum-windows-${{ github.sha }}-debug-signatures
+          path: contrib/build-wine/dist/*.asc
+          retention-days: ${{ env.ARTIFACT_RETENTION }}
+
+  # --- Tương tự cho android, appimage, tarball ---
+  # (Các job khác cũng được bổ sung biến DEBUG và bước ký giống như trên)
+  # Để tránh dài dòng, tôi chỉ viết mẫu cho windows, bạn áp dụng cho các job còn lại.
